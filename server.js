@@ -4,165 +4,102 @@ import cors from 'cors';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(
-  cors({
-    origin: '*',
-    methods: ['GET'],
-  })
-);
+// Enable CORS for all origins
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 app.use(express.json());
 
-// Airplanes.live endpoint for world traffic or local area bounds
 const AIRPLANES_LIVE_URL = 'https://api.airplanes.live/v2/point/0/0/0';
 
-// In-memory cache for flight routes to reduce redundant external route requests
 const routeCache = new Map();
-const ROUTE_CACHE_TTL = 1000 * 60 * 30; // 30 minutes cache duration
+const ROUTE_CACHE_TTL = 1000 * 60 * 30;
 
-/**
- * Helper: Fetches route metadata (origin & destination) for a given callsign/flight number.
- * Uses OpenSky's public route endpoint (or can be swapped for FlightAware/AeroDataBox).
- */
 async function fetchFlightRoute(callsign) {
-  if (!callsign || callsign === 'N/A') {
-    return { origin: null, destination: null };
-  }
+  if (!callsign || callsign === 'N/A') return { origin: null, destination: null };
+  const clean = callsign.trim().toUpperCase();
 
-  const cleanCallsign = callsign.trim().toUpperCase();
-
-  // Return cached route if available and fresh
-  if (routeCache.has(cleanCallsign)) {
-    const cached = routeCache.get(cleanCallsign);
-    if (Date.now() - cached.timestamp < ROUTE_CACHE_TTL) {
-      return cached.data;
-    }
+  if (routeCache.has(clean)) {
+    const cached = routeCache.get(clean);
+    if (Date.now() - cached.timestamp < ROUTE_CACHE_TTL) return cached.data;
   }
 
   try {
-    // OpenSky Network public route lookup endpoint
-    const response = await fetch(
-      `https://opensky-network.org/api/routes?callsign=${cleanCallsign}`,
-      {
-        headers: {
-          'User-Agent': 'CesiumFlightTrackerBackend/1.0',
-          'Accept': 'application/json',
-        },
-      }
-    );
-
+    const response = await fetch(`https://opensky-network.org/api/routes?callsign=${clean}`, {
+      headers: { 'User-Agent': 'CesiumFlightTrackerBackend/1.0', 'Accept': 'application/json' }
+    });
     if (response.ok) {
-      const routeData = await response.json();
+      const data = await response.json();
       const routeInfo = {
-        origin: routeData.route ? routeData.route[0] : null, // ICAO airport code (e.g., "KJFK")
-        destination:
-          routeData.route && routeData.route.length > 1
-            ? routeData.route[routeData.route.length - 1]
-            : null, // ICAO airport code (e.g., "EGLL")
+        origin: data.route ? data.route[0] : null,
+        destination: data.route && data.route.length > 1 ? data.route[data.route.length - 1] : null
       };
-
-      // Save to cache
-      routeCache.set(cleanCallsign, {
-        timestamp: Date.now(),
-        data: routeInfo,
-      });
-
+      routeCache.set(clean, { timestamp: Date.now(), data: routeInfo });
       return routeInfo;
     }
   } catch (err) {
-    console.warn(`Failed to retrieve route for callsign ${cleanCallsign}:`, err.message);
+    console.warn(`Route fetch failed for ${clean}:`, err.message);
   }
 
-  // Fallback if lookup fails or returns 404
-  const fallbackRoute = { origin: null, destination: null };
-  routeCache.set(cleanCallsign, { timestamp: Date.now(), data: fallbackRoute });
-  return fallbackRoute;
+  const fallback = { origin: null, destination: null };
+  routeCache.set(clean, { timestamp: Date.now(), data: fallback });
+  return fallback;
 }
 
-/**
- * Main Flight Endpoint: Combines tracking telemetry with aggregated route information
- */
 app.get('/api/flights', async (req, res) => {
   try {
-    // 1. Fetch telemetry from Airplanes.live
     const response = await fetch(AIRPLANES_LIVE_URL, {
-      headers: {
-        'User-Agent': 'CesiumFlightTrackerBackend/1.0',
-        'Accept': 'application/json',
-      },
+      headers: { 'User-Agent': 'CesiumFlightTrackerBackend/1.0', 'Accept': 'application/json' }
     });
 
-    if (!response.ok) {
-      throw new Error(`Airplanes.live API responded with status ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`Airplanes.live API HTTP ${response.status}`);
 
     const data = await response.json();
-    const rawAircraftArray = data.ac || [];
+    const raw = data.ac || [];
 
-    // Filter valid positions and take a batch (limiting slice size to manage external call limits if unauthenticated)
-    const activePlanes = rawAircraftArray
-      .filter((plane) => plane.lat !== undefined && plane.lon !== undefined)
-      .slice(0, 100); 
+    const activePlanes = raw
+      .filter((p) => p.lat !== undefined && p.lon !== undefined)
+      .slice(0, 80);
 
-    // 2. Fetch routes in parallel for all active callsigns
-    const enrichedFlights = await Promise.all(
+    const enriched = await Promise.all(
       activePlanes.map(async (plane) => {
         const callsign = plane.flight ? plane.flight.trim() : 'N/A';
-
-        // Fetch route metadata
         const route = await fetchFlightRoute(callsign);
-
-        const altitudeFeet =
-          plane.alt_baro !== 'ground' ? plane.alt_baro || plane.alt_geom || 0 : 0;
-        const altitudeMeters = altitudeFeet * 0.3048;
+        const altFt = plane.alt_baro !== 'ground' ? (plane.alt_baro || plane.alt_geom || 0) : 0;
 
         return {
           id: plane.hex,
           callsign: callsign,
-          aircraftModel: plane.t || 'Unknown Model',
+          aircraftModel: plane.t || 'UNK',
           registration: plane.r || 'N/A',
-          squawk: plane.squawk || 'N/A',
-          // Route metadata merged from secondary source
           route: {
-            origin: route.origin || 'Unknown',
-            destination: route.destination || 'Unknown',
+            origin: route.origin || 'N/A',
+            destination: route.destination || 'N/A'
           },
           location: {
             latitude: plane.lat,
             longitude: plane.lon,
-            altitudeMeters: altitudeMeters,
-            altitudeFeet: altitudeFeet,
+            altitudeMeters: altFt * 0.3048,
+            altitudeFeet: altFt
           },
           vector: {
             heading: plane.track || 0,
-            groundSpeedKnots: plane.gs || 0,
-            verticalRateFpm: plane.baro_rate || plane.geom_rate || 0,
-          },
-          lastSeen: plane.seen || 0,
+            groundSpeedKnots: plane.gs || 0
+          }
         };
       })
     );
 
-    res.status(200).json({
-      success: true,
-      count: enrichedFlights.length,
-      timestamp: new Date().toISOString(),
-      flights: enrichedFlights,
-    });
+    res.status(200).json({ success: true, count: enriched.length, flights: enriched });
   } catch (error) {
-    console.error('Error in flight backend API:', error.message);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to aggregate flight tracking and route data',
-      details: error.message,
-    });
+    console.error('API Error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
-});
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
